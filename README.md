@@ -27,7 +27,7 @@ nano install_namyudp.sh
 chmod +x install_namyudp.sh; ./install_namyudp.sh
 ```
 # Remove
-
+```
 rm /usr/local/bin/hysteria
 ```
 rm /etc/systemd/system/hysteria-server.service
