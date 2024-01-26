@@ -877,7 +877,7 @@ perform_install() {
 							echo
 							echo -e "$(tbold)Congratulation! NAMY-UDP has been successfully installed on your server.$(treset)"
 							echo
-							echo -e "$(tbold)Client app AGN INJECTOR:$(treset)"
+							echo -e "$(tbold)Client app MB INJECTOR:$(treset)"
 							echo -e "$(tblue)https://play.google.com/store/apps/details?id=com.mb.injector$(treset)"
 							echo
 							echo -e "Follow me!"
