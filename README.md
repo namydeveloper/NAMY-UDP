@@ -29,9 +29,9 @@ chmod +x install_namyudp.sh; ./install_namyudp.sh
 # Remove
 
 rm /usr/local/bin/hysteria
-
+```
 rm /etc/systemd/system/hysteria-server.service
-
+```
 ## :octocat: by NAMYDEVELOPER
 <ul>
  <li>TELEGRAM CHANNEL: https://t.me/Namydev</li>
