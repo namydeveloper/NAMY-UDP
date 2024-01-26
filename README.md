@@ -30,6 +30,7 @@ chmod +x install_namyudp.sh; ./install_namyudp.sh
 ```
 rm /usr/local/bin/hysteria
 ```
+```
 rm /etc/systemd/system/hysteria-server.service
 ```
 ## :octocat: by NAMYDEVELOPER
