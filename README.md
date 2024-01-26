@@ -27,7 +27,7 @@ nano install_namyudp.sh
 chmod +x install_namyudp.sh; ./install_namyudp.sh
 ```
 
-## :octocat: by KHALED AGN
+## :octocat: by NAMYDEVELOPER
 <ul>
  <li>TELEGRAM CHANNEL: https://t.me/Namydev</li>
  <li>FACEBOOK: https://www.facebook.com/Namydeveloper.me</li>
