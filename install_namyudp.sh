@@ -2,7 +2,7 @@
 #
 # Try `install_namyudp.sh --help` for usage.
 #
-# (c) 2023 Khaled AGN
+# (c) 2023 Namydev
 #
 
 set -e
