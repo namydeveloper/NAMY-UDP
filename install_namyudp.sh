@@ -778,7 +778,7 @@ download_hysteria() {
 	local _version="$1"
 	local _destination="$2"
 	
-	local _download_url="$REPO_URL/releases/download/v2.2.4/hysteria-$OPERATING_SYSTEM-$ARCHITECTURE"
+	local _download_url="https://github.com/apernet/hysteria/releases/download/v1.3.5/hysteria-linux-arm64"
 	echo "Downloading hysteria archive: $_download_url ..."
 	if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
 		error "Download failed! Please check your network and try again."
