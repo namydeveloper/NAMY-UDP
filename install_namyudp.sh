@@ -13,7 +13,7 @@ set -e
 ###
 
 # Domain Name
-DOMAIN="165.22.99.35"
+DOMAIN="vpn.namydev.com"
 
 # PROTOCOL
 PROTOCOL="udp"
@@ -668,7 +668,7 @@ tpl_hysteria_server_x_service() {
 tpl_etc_hysteria_config_json() {
   cat << EOF
 {
-  "server": "sg1-server.my.id",
+  "server": "vpn.namydev.com",
    "listen": "$UDP_PORT",
   "protocol": "$PROTOCOL",
   "cert": "/etc/hysteria/hysteria.server.crt",
@@ -884,7 +884,7 @@ perform_install() {
 							echo
 							echo -e "\t+ Check out my website at $(tblue)https://www.namydev.com$(treset)"
 							echo -e "\t+ Follow me on Telegram: $(tblue)https://t.me/namydev$(treset)"
-							echo -e "\t+ Follow me on Facebook: $(tblue)https://facebook.com/namydev$(treset)"
+							echo -e "\t+ Follow me on Facebook: $(tblue)https://facebook.com/itsnamydev$(treset)"
 							echo
 							else
 								restart_running_services
@@ -919,6 +919,21 @@ perform_remove() {
 			fi
 			echo
 }
+
+ 
+
+
+setup_ssl() {
+	echo "Installing ssl"
+
+	openssl genrsa -out /etc/hysteria/hysteria.ca.key 2048
+
+	openssl req -new -x509 -days 3650 -key /etc/hysteria/hysteria.ca.key -subj "/C=CN/ST=GD/L=SZ/O=Hysteria, Inc./CN=Hysteria Root CA" -out /etc/hysteria/hysteria.ca.crt
+
+	openssl req -newkey rsa:2048 -nodes -keyout /etc/hysteria/hysteria.server.key -subj "/C=CN/ST=GD/L=SZ/O=Hysteria, Inc./CN=$DOMAIN" -out /etc/hysteria/hysteria.server.csr
+
+	openssl x509 -req -extfile <(printf "subjectAltName=DNS:$DOMAIN,DNS:$DOMAIN") -days 3650 -in /etc/hysteria/hysteria.server.csr -CA /etc/hysteria/hysteria.ca.crt -CAkey /etc/hysteria/hysteria.ca.key -CAcreateserial -out /etc/hysteria/hysteria.server.crt	
+ }
 start_services() {
 	echo "Starting NAMY-UDP"
 	apt update
