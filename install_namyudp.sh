@@ -863,18 +863,14 @@ perform_install_hysteria_home_legacy() {
 }
 
 perform_install_user_manager() {
+  install -d -m 700 "$CONFIG_DIR"
   if [[ ! -f "$CONFIG_DIR/users.json" ]]; then
     python3 - "$PASSWORD" <<'SEED_USERS'
-import json, pathlib, sys
-pathlib.Path('/etc/hysteria/users.json').write_text(json.dumps({'admin': sys.argv[1]}, indent=2) + '\n')
+import json, pathlib, sys, time
+path=pathlib.Path('/etc/hysteria/users.json')
+path.write_text(json.dumps({'admin': {'password':sys.argv[1], 'expires_at':0, 'allowed_ip':''}}, indent=2)+'\n')
+path.chmod(0o600)
 SEED_USERS
-    python3 - <<'SYNC_AUTH'
-import json, pathlib
-p=pathlib.Path('/etc/hysteria/config.json')
-c=json.loads(p.read_text())
-c.setdefault('auth', {})['config'] = list(json.loads(pathlib.Path('/etc/hysteria/users.json').read_text()).values())
-p.write_text(json.dumps(c, indent=2) + '\n')
-SYNC_AUTH
   fi
   cat > "$USER_MANAGER_PATH" <<'NAMYUDP_USER_MANAGER'
 #!/usr/bin/env bash
@@ -882,61 +878,204 @@ set -euo pipefail
 CONFIG=/etc/hysteria/config.json
 USERS=/etc/hysteria/users.json
 SERVICE=hysteria-server.service
-if [[ $EUID -ne 0 ]]; then echo 'Jalankan dengan sudo/root.' >&2; exit 1; fi
-if ! command -v python3 >/dev/null 2>&1; then echo 'python3 belum terpasang.' >&2; exit 1; fi
-case "${1:-help}" in
-  add)
-    [[ $# -eq 3 ]] || { echo 'Pakai: namyudp-user add <username> <password>' >&2; exit 2; }
-    USERNAME="$2" PASSWORD="$3" python3 - <<'ADD_USER'
-import json, os, pathlib, sys
+MANAGER=/usr/local/bin/namyudp-user
+CRON=/etc/cron.d/namyudp-expiry
+
+[[ $EUID -eq 0 ]] || { echo 'Jalankan dengan root: sudo namyudp-user'; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo 'Python3 belum terpasang.'; exit 1; }
+
+sync_auth() {
+  python3 - <<'PY_SYNC'
+import json, pathlib, os, tempfile, sys, time
 cp=pathlib.Path('/etc/hysteria/config.json'); up=pathlib.Path('/etc/hysteria/users.json')
-name=os.environ['USERNAME']; password=os.environ['PASSWORD']
-if not name or any(c.isspace() for c in name) or len(name)>64: sys.exit('Username wajib, maksimal 64 karakter, tanpa spasi.')
-if len(password)<8: sys.exit('Password minimal 8 karakter.')
-users=json.loads(up.read_text()) if up.exists() else {}
-if name in users: sys.exit('Username sudah ada.')
+if not cp.exists() or not up.exists(): sys.exit('File konfigurasi/akun tidak ditemukan.')
+users=json.loads(up.read_text()); now=time.time(); changed=False
+# Migrate legacy {username: "password"} entries to structured records.
+for name, value in list(users.items()):
+    if isinstance(value, str):
+        users[name]={'password':value,'expires_at':0,'allowed_ip':''}; changed=True
+# Remove expired users (expires_at=0 means unlimited).
+for name, value in list(users.items()):
+    expiry=int(value.get('expires_at') or 0)
+    if expiry and expiry <= now:
+        del users[name]; changed=True
 cfg=json.loads(cp.read_text()); auth=cfg.setdefault('auth', {})
-if auth.get('mode')!='passwords': sys.exit("Auth config bukan mode 'passwords'; tidak diubah.")
-users[name]=password; auth['config']=list(dict.fromkeys(users.values()))
-up.write_text(json.dumps(users,indent=2)+'\n'); cp.write_text(json.dumps(cfg,indent=2)+'\n')
-print('Akun ditambahkan:',name)
-ADD_USER
-    systemctl restart "$SERVICE"
-    ;;
-  remove)
-    [[ $# -eq 2 ]] || { echo 'Pakai: namyudp-user remove <username>' >&2; exit 2; }
-    USERNAME="$2" python3 - <<'REMOVE_USER'
+if auth.get('mode') != 'passwords': sys.exit("Auth config bukan mode 'passwords'; konfigurasi tidak diubah.")
+passwords=list(dict.fromkeys(str(v['password']) for v in users.values() if v.get('password')))
+auth['config']=passwords
+# Atomic writes and restrictive permissions.
+def atomic_write(path, content):
+    fd,tmp=tempfile.mkstemp(dir=str(path.parent), prefix=path.name+'.')
+    with os.fdopen(fd,'w') as f: f.write(content)
+    os.chmod(tmp,0o600); os.replace(tmp,path)
+atomic_write(up,json.dumps(users,indent=2)+'\n')
+atomic_write(cp,json.dumps(cfg,indent=2)+'\n')
+PY_SYNC
+  systemctl restart "$SERVICE"
+}
+
+expire_only() {
+  local expired
+  expired=$(python3 - <<'PY_EXPIRE'
+import json, pathlib, time
+up=pathlib.Path('/etc/hysteria/users.json')
+if not up.exists(): print(0); raise SystemExit
+users=json.loads(up.read_text()); now=time.time()
+print(sum(1 for v in users.values() if isinstance(v,dict) and int(v.get('expires_at') or 0) and int(v.get('expires_at') or 0) <= now))
+PY_EXPIRE
+)
+  if [[ "$expired" -gt 0 ]]; then
+    python3 - <<'PY_EXPIRE_REMOVE'
+import json, pathlib, time, os, tempfile
+up=pathlib.Path('/etc/hysteria/users.json')
+users=json.loads(up.read_text()); now=time.time(); before=len(users)
+for name, value in list(users.items()):
+    if isinstance(value,dict):
+        exp=int(value.get('expires_at') or 0)
+        if exp and exp <= now: del users[name]
+fd,tmp=tempfile.mkstemp(dir=str(up.parent),prefix='users.json.')
+with os.fdopen(fd,'w') as f: f.write(json.dumps(users,indent=2)+'\n')
+os.chmod(tmp,0o600); os.replace(tmp,up)
+print('Akun kedaluwarsa dihapus:',before-len(users))
+PY_EXPIRE_REMOVE
+    sync_auth
+  fi
+}
+
+create_user() {
+  local username password duration ip
+  read -r -p 'Username: ' username
+  [[ -n "$username" && "$username" != *[[:space:]]* ]] || { echo 'Username wajib dan tidak boleh mengandung spasi.'; return 1; }
+  read -r -s -p 'Password (minimal 8 karakter): ' password; echo
+  (( ${#password} >= 8 )) || { echo 'Password minimal 8 karakter.'; return 1; }
+  read -r -p 'Durasi akun (hari, 0 = tanpa batas): ' duration
+  [[ "$duration" =~ ^[0-9]+$ ]] || { echo 'Durasi harus angka.'; return 1; }
+  read -r -p 'IP yang diizinkan (kosong jika tidak dicatat): ' ip
+  USERNAME="$username" PASSWORD="$password" DURATION="$duration" ALLOWED_IP="$ip" python3 - <<'PY_ADD'
+import json, os, pathlib, sys, time, ipaddress
+up=pathlib.Path('/etc/hysteria/users.json')
+users=json.loads(up.read_text()) if up.exists() else {}
+# migrate old format
+for k,v in list(users.items()):
+    if isinstance(v,str): users[k]={'password':v,'expires_at':0,'allowed_ip':''}
+name=os.environ['USERNAME']; password=os.environ['PASSWORD']; days=int(os.environ['DURATION']); ip=os.environ['ALLOWED_IP'].strip()
+if name in users: sys.exit('Username sudah ada.')
+if ip:
+    try: ip=str(ipaddress.ip_address(ip))
+    except ValueError: sys.exit('IP tidak valid. Masukkan satu alamat IPv4 atau IPv6.')
+users[name]={'password':password,'expires_at':int(time.time()+days*86400) if days else 0,'allowed_ip':ip}
+up.write_text(json.dumps(users,indent=2)+'\n'); up.chmod(0o600)
+print('Akun berhasil dibuat:',name)
+print('Durasi:',f'{days} hari' if days else 'tanpa batas')
+print('IP dicatat:',ip or 'tidak ditentukan')
+print('CATATAN: IP per akun belum bisa ditegakkan oleh auth password Hysteria bawaan; ini hanya tersimpan sebagai metadata.')
+PY_ADD
+  sync_auth
+}
+
+list_users() {
+  python3 - <<'PY_LIST'
+import json, pathlib, datetime, time
+p=pathlib.Path('/etc/hysteria/users.json')
+users=json.loads(p.read_text()) if p.exists() else {}
+if not users: print('Belum ada akun.'); raise SystemExit
+print(f"{'USERNAME':20} {'STATUS':14} {'SISA':12} {'IP TERCATAT'}")
+for name,v in users.items():
+    if isinstance(v,str): v={'password':v,'expires_at':0,'allowed_ip':''}
+    exp=int(v.get('expires_at') or 0)
+    if not exp: status='Aktif'; remain='Tanpa batas'
+    elif exp<=time.time(): status='Kedaluwarsa'; remain='0 hari'
+    else: status='Aktif'; remain=f"{max(1,int((exp-time.time()+86399)//86400))} hari"
+    print(f"{name:20} {status:14} {remain:12} {v.get('allowed_ip') or '-'}")
+print('\nPassword tidak ditampilkan. IP di atas hanya metadata, bukan pembatasan aktif per akun.')
+PY_LIST
+}
+
+delete_user() {
+  local username
+  read -r -p 'Username yang akan dihapus: ' username
+  USERNAME="$username" python3 - <<'PY_DEL'
 import json, os, pathlib, sys
-cp=pathlib.Path('/etc/hysteria/config.json'); up=pathlib.Path('/etc/hysteria/users.json')
-if not up.exists(): sys.exit('Database akun tidak ditemukan.')
-users=json.loads(up.read_text()); name=os.environ['USERNAME']
-if name not in users: sys.exit('Username tidak ditemukan.')
-del users[name]; cfg=json.loads(cp.read_text()); cfg.setdefault('auth',{})['config']=list(dict.fromkeys(users.values()))
-up.write_text(json.dumps(users,indent=2)+'\n'); cp.write_text(json.dumps(cfg,indent=2)+'\n')
+p=pathlib.Path('/etc/hysteria/users.json')
+if not p.exists(): sys.exit('Database akun tidak ditemukan.')
+u=json.loads(p.read_text()); name=os.environ['USERNAME']
+if name not in u: sys.exit('Username tidak ditemukan.')
+del u[name]
+p.write_text(json.dumps(u,indent=2)+'\n'); p.chmod(0o600)
 print('Akun dihapus:',name)
-REMOVE_USER
-    systemctl restart "$SERVICE"
-    ;;
-  list)
-    python3 - <<'LIST_USERS'
-import json, pathlib
-p=pathlib.Path('/etc/hysteria/users.json'); users=json.loads(p.read_text()) if p.exists() else {}
-print('Akun tersedia:' if users else 'Belum ada akun.')
-for name in users: print('-',name)
-print('Password tidak ditampilkan.')
-LIST_USERS
-    ;;
-  help|--help|-h)
-    echo 'Perintah akun NAMY-UDP:'
-    echo '  namyudp-user add <username> <password>'
-    echo '  namyudp-user remove <username>'
-    echo '  namyudp-user list'
-    ;;
-  *) echo 'Perintah tidak dikenal; jalankan namyudp-user --help.' >&2; exit 2 ;;
+PY_DEL
+  sync_auth
+}
+
+uninstall_all() {
+  echo 'Ini akan menghapus service Hysteria, binary, konfigurasi, sertifikat, database akun, dan menu akun.'
+  read -r -p 'Ketik HAPUS untuk melanjutkan: ' confirm
+  [[ "$confirm" == HAPUS ]] || { echo 'Dibatalkan.'; return; }
+  systemctl disable --now "$SERVICE" 2>/dev/null || true
+  systemctl disable --now hysteria-expiry.timer 2>/dev/null || true
+  rm -f /etc/systemd/system/hysteria-expiry.service /etc/systemd/system/hysteria-expiry.timer "$CRON"
+  rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service
+  rm -f "$MANAGER" /usr/local/bin/hysteria
+  rm -rf /etc/hysteria
+  systemctl daemon-reload
+  echo 'Komponen NAMY-UDP dihapus. Aturan firewall/NAT tidak dihapus otomatis demi keamanan; periksa secara manual.'
+  exit 0
+}
+
+case "${1:-menu}" in
+  cleanup) expire_only; exit 0 ;;
+  add) create_user; exit 0 ;;
+  remove) delete_user; exit 0 ;;
+  list) list_users; exit 0 ;;
+  uninstall|--uninstall) uninstall_all ;;
+  menu|help|--help|-h) ;;
+  *) echo 'Gunakan: namyudp-user [menu|add|list|remove|cleanup|uninstall]'; exit 2 ;;
 esac
+
+while true; do
+  echo
+  echo '====== MANAJEMEN NAMY-UDP ======'
+  echo '1. Buat akun baru'
+  echo '2. Lihat akun'
+  echo '3. Hapus akun'
+  echo '4. Bersihkan akun kedaluwarsa'
+  echo '5. Uninstall NAMY-UDP'
+  echo '0. Keluar'
+  read -r -p 'Pilih menu [0-5]: ' choice
+  case "$choice" in
+    1) create_user ;;
+    2) list_users ;;
+    3) delete_user ;;
+    4) expire_only ;;
+    5) uninstall_all ;;
+    0) exit 0 ;;
+    *) echo 'Pilihan tidak valid.' ;;
+  esac
+done
 NAMYUDP_USER_MANAGER
   chmod 0750 "$USER_MANAGER_PATH"
-  echo 'Install user manager ... ok'
+
+  # Run expiration cleanup every five minutes.
+  cat > /etc/systemd/system/hysteria-expiry.service <<'EXPIRY_SERVICE'
+[Unit]
+Description=Expire NAMY-UDP accounts
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/namyudp-user cleanup
+EXPIRY_SERVICE
+  cat > /etc/systemd/system/hysteria-expiry.timer <<'EXPIRY_TIMER'
+[Unit]
+Description=Run NAMY-UDP account expiry cleanup periodically
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+[Install]
+WantedBy=timers.target
+EXPIRY_TIMER
+  systemctl daemon-reload
+  systemctl enable --now hysteria-expiry.timer
+  echo 'Install menu akun ... ok'
 }
 
 configure_installation() {
@@ -966,6 +1105,9 @@ perform_install() {
 		_is_frash_install=1
 		fi
 		
+                        if [[ -n "$_is_frash_install" ]]; then
+                            configure_installation
+                        fi
  						perform_install_hysteria_binary
 						perform_install_hysteria_example_config
 						perform_install_hysteria_home_legacy
