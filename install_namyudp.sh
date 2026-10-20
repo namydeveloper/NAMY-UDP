@@ -13,19 +13,19 @@ set -e
 ###
 
 # Domain Name
-DOMAIN="vpn.namydev.com"
+DOMAIN="${DOMAIN:-vpn.namydev.com}"
 
 # PROTOCOL
 PROTOCOL="udp"
 
 # UDP PORT
-UDP_PORT=":36712"
+UDP_PORT="${UDP_PORT:-:36712}"
 
 # OBFS
-OBFS="namyudp"
+OBFS="${OBFS:-namyudp}"
 
 # PASSWORDS
-PASSWORD="namyudp"
+PASSWORD="${PASSWORD:-namyudp}"
 
 # Basename of this script
 SCRIPT_NAME="$(basename "$0")"
@@ -41,6 +41,7 @@ SYSTEMD_SERVICES_DIR="/etc/systemd/system"
 
 # Directory to store hysteria config file
 CONFIG_DIR="/etc/hysteria"
+USER_MANAGER_PATH="/usr/local/bin/namyudp-user"
 
 # URLs of GitHub
 REPO_URL="https://github.com/apernet/hysteria"
@@ -861,6 +862,104 @@ perform_install_hysteria_home_legacy() {
 		fi
 }
 
+perform_install_user_manager() {
+  if [[ ! -f "$CONFIG_DIR/users.json" ]]; then
+    python3 - "$PASSWORD" <<'SEED_USERS'
+import json, pathlib, sys
+pathlib.Path('/etc/hysteria/users.json').write_text(json.dumps({'admin': sys.argv[1]}, indent=2) + '\n')
+SEED_USERS
+    python3 - <<'SYNC_AUTH'
+import json, pathlib
+p=pathlib.Path('/etc/hysteria/config.json')
+c=json.loads(p.read_text())
+c.setdefault('auth', {})['config'] = list(json.loads(pathlib.Path('/etc/hysteria/users.json').read_text()).values())
+p.write_text(json.dumps(c, indent=2) + '\n')
+SYNC_AUTH
+  fi
+  cat > "$USER_MANAGER_PATH" <<'NAMYUDP_USER_MANAGER'
+#!/usr/bin/env bash
+set -euo pipefail
+CONFIG=/etc/hysteria/config.json
+USERS=/etc/hysteria/users.json
+SERVICE=hysteria-server.service
+if [[ $EUID -ne 0 ]]; then echo 'Jalankan dengan sudo/root.' >&2; exit 1; fi
+if ! command -v python3 >/dev/null 2>&1; then echo 'python3 belum terpasang.' >&2; exit 1; fi
+case "${1:-help}" in
+  add)
+    [[ $# -eq 3 ]] || { echo 'Pakai: namyudp-user add <username> <password>' >&2; exit 2; }
+    USERNAME="$2" PASSWORD="$3" python3 - <<'ADD_USER'
+import json, os, pathlib, sys
+cp=pathlib.Path('/etc/hysteria/config.json'); up=pathlib.Path('/etc/hysteria/users.json')
+name=os.environ['USERNAME']; password=os.environ['PASSWORD']
+if not name or any(c.isspace() for c in name) or len(name)>64: sys.exit('Username wajib, maksimal 64 karakter, tanpa spasi.')
+if len(password)<8: sys.exit('Password minimal 8 karakter.')
+users=json.loads(up.read_text()) if up.exists() else {}
+if name in users: sys.exit('Username sudah ada.')
+cfg=json.loads(cp.read_text()); auth=cfg.setdefault('auth', {})
+if auth.get('mode')!='passwords': sys.exit("Auth config bukan mode 'passwords'; tidak diubah.")
+users[name]=password; auth['config']=list(dict.fromkeys(users.values()))
+up.write_text(json.dumps(users,indent=2)+'\n'); cp.write_text(json.dumps(cfg,indent=2)+'\n')
+print('Akun ditambahkan:',name)
+ADD_USER
+    systemctl restart "$SERVICE"
+    ;;
+  remove)
+    [[ $# -eq 2 ]] || { echo 'Pakai: namyudp-user remove <username>' >&2; exit 2; }
+    USERNAME="$2" python3 - <<'REMOVE_USER'
+import json, os, pathlib, sys
+cp=pathlib.Path('/etc/hysteria/config.json'); up=pathlib.Path('/etc/hysteria/users.json')
+if not up.exists(): sys.exit('Database akun tidak ditemukan.')
+users=json.loads(up.read_text()); name=os.environ['USERNAME']
+if name not in users: sys.exit('Username tidak ditemukan.')
+del users[name]; cfg=json.loads(cp.read_text()); cfg.setdefault('auth',{})['config']=list(dict.fromkeys(users.values()))
+up.write_text(json.dumps(users,indent=2)+'\n'); cp.write_text(json.dumps(cfg,indent=2)+'\n')
+print('Akun dihapus:',name)
+REMOVE_USER
+    systemctl restart "$SERVICE"
+    ;;
+  list)
+    python3 - <<'LIST_USERS'
+import json, pathlib
+p=pathlib.Path('/etc/hysteria/users.json'); users=json.loads(p.read_text()) if p.exists() else {}
+print('Akun tersedia:' if users else 'Belum ada akun.')
+for name in users: print('-',name)
+print('Password tidak ditampilkan.')
+LIST_USERS
+    ;;
+  help|--help|-h)
+    echo 'Perintah akun NAMY-UDP:'
+    echo '  namyudp-user add <username> <password>'
+    echo '  namyudp-user remove <username>'
+    echo '  namyudp-user list'
+    ;;
+  *) echo 'Perintah tidak dikenal; jalankan namyudp-user --help.' >&2; exit 2 ;;
+esac
+NAMYUDP_USER_MANAGER
+  chmod 0750 "$USER_MANAGER_PATH"
+  echo 'Install user manager ... ok'
+}
+
+configure_installation() {
+  local input_domain input_port input_obfs input_password default_port
+  echo
+  echo '=== Konfigurasi NAMY-UDP ==='
+  read -r -p "Domain yang sudah diarahkan ke IP VPS [$DOMAIN]: " input_domain
+  [[ -n "$input_domain" ]] && DOMAIN="$input_domain"
+  if [[ "$DOMAIN" =~ ^[0-9.]+$ ]]; then error 'Masukkan domain DNS, bukan IP.'; exit 2; fi
+  default_port="${UDP_PORT#:}"
+  read -r -p "Port UDP layanan [$default_port]: " input_port
+  [[ -n "$input_port" ]] && default_port="$input_port"
+  if [[ ! "$default_port" =~ ^[0-9]+$ ]] || (( default_port < 1 || default_port > 65535 )); then error 'Port harus angka 1-65535.'; exit 2; fi
+  UDP_PORT=":$default_port"
+  read -r -p "Obfs server (harus sama dengan client) [$OBFS]: " input_obfs
+  [[ -n "$input_obfs" ]] && OBFS="$input_obfs"
+  read -r -s -p 'Password akun awal (minimal 8 karakter): ' input_password; echo
+  [[ -n "$input_password" ]] && PASSWORD="$input_password"
+  if (( ${#PASSWORD} < 8 )); then error 'Password minimal 8 karakter.'; exit 2; fi
+  echo "Domain: $DOMAIN"; echo "Port layanan UDP: $UDP_PORT"; echo "Obfs: $OBFS"; echo 'Password: (disembunyikan)'
+  echo 'Pastikan DNS A record domain mengarah ke IP publik VPS.'; echo
+}
+
 perform_install() {
 	local _is_frash_install
 	if ! is_hysteria_installed; then
@@ -871,6 +970,7 @@ perform_install() {
 						perform_install_hysteria_example_config
 						perform_install_hysteria_home_legacy
 						perform_install_hysteria_systemd
+                        perform_install_user_manager
 						setup_ssl
 					    start_services
 						if [[ -n "$_is_frash_install" ]]; then
